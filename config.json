@@ -1,7 +1,7 @@
 {
     "port": 7000,
     "address": "0.0.0.0",
-    "version": "0.4.0d",
+    "version": "0.4.0",
     "fileLogLevel": "info",
     "logFileName": "logs/lisk.log",
     "consoleLogLevel": "info",
@@ -63,7 +63,6 @@
                 "delayAfter": 0,
                 "windowMs": 60000
             },
-            "maxUpdatePeers": 20,
             "timeout": 5000
         }
     },

@@ -21,12 +21,11 @@ __private.network = {
 
 __private.loaded = false;
 __private.isActive = false;
-__private.loadingLastBlock = null;
+__private.lastBlock = null;
 __private.genesisBlock = null;
 __private.total = 0;
 __private.blocksToSync = 0;
 __private.syncIntervalId = null;
-__private.retryInterval = 10000;
 
 // Constructor
 function Loader (cb, scope) {
@@ -34,7 +33,7 @@ function Loader (cb, scope) {
 	self = this;
 
 	__private.attachApi();
-	__private.genesisBlock = __private.loadingLastBlock = library.genesisblock;
+	__private.genesisBlock = __private.lastBlock = library.genesisblock;
 
 	setImmediate(cb, null, self);
 }
@@ -79,73 +78,110 @@ __private.syncTrigger = function (turnOn) {
 };
 
 __private.loadSignatures = function (cb) {
-	modules.transport.getFromRandomPeer({
-		api: '/signatures',
-		method: 'GET'
-	}, function (err, res) {
-		if (err) {
-			return setImmediate(cb);
-		}
+	async.waterfall([
+		function (waterCb) {
+			self.getNetwork(function (err, network) {
+				if (err) {
+					return setImmediate(waterCb, err);
+				} else {
+					var peer = network.peers[Math.floor(Math.random() * network.peers.length)];
+					return setImmediate(waterCb, null, peer);
+				}
+			});
+		},
+		function (peer, waterCb) {
+			library.logger.info('Loading signatures from: ' + peer.string);
 
-		library.schema.validate(res.body, schema.loadSignatures, function (err) {
-			if (err) {
-				return setImmediate(cb);
-			}
-
+			modules.transport.getFromPeer(peer, {
+				api: '/signatures',
+				method: 'GET'
+			}, function (err, res) {
+				if (err) {
+					return setImmediate(waterCb, err);
+				} else {
+					library.schema.validate(res.body, schema.loadSignatures, function (err) {
+						return setImmediate(waterCb, err, res.body.signatures);
+					});
+				}
+			});
+		},
+		function (signatures, waterCb) {
 			library.sequence.add(function (cb) {
-				async.eachSeries(res.body.signatures, function (signature, cb) {
-					async.eachSeries(signature.signatures, function (s, cb) {
+				async.eachSeries(signatures, function (signature, eachSeriesCb) {
+					async.eachSeries(signature.signatures, function (s, eachSeriesCb) {
 						modules.multisignatures.processSignature({
 							signature: s,
 							transaction: signature.transaction
 						}, function (err) {
-							return setImmediate(cb);
+							return setImmediate(eachSeriesCb);
 						});
-					}, cb);
+					}, eachSeriesCb);
 				}, cb);
-			}, cb);
-		});
+			}, waterCb);
+		}
+	], function (err) {
+		return setImmediate(cb, err);
 	});
 };
 
 __private.loadUnconfirmedTransactions = function (cb) {
-	modules.transport.getFromRandomPeer({
-		api: '/transactions',
-		method: 'GET'
-	}, function (err, res) {
-		if (err) {
-			return setImmediate(cb);
+	async.waterfall([
+		function (waterCb) {
+			self.getNetwork(function (err, network) {
+				if (err) {
+					return setImmediate(waterCb, err);
+				} else {
+					var peer = network.peers[Math.floor(Math.random() * network.peers.length)];
+					return setImmediate(waterCb, null, peer);
+				}
+			});
+		},
+		function (peer, waterCb) {
+			library.logger.info('Loading unconfirmed transactions from: ' + peer.string);
+
+			modules.transport.getFromPeer(peer, {
+				api: '/transactions',
+				method: 'GET'
+			}, function (err, res) {
+				if (err) {
+					return setImmediate(waterCb, err);
+				}
+
+				library.schema.validate(res.body, schema.loadUnconfirmedTransactions, function (err) {
+					if (err) {
+						return setImmediate(waterCb, err[0].message);
+					} else {
+						return setImmediate(waterCb, null, peer, res.body.transactions);
+					}
+				});
+			});
+		},
+		function (peer, transactions, waterCb) {
+			async.eachSeries(transactions, function (transaction, eachSeriesCb) {
+				var id = (transaction ? transactions.id : 'null');
+
+				try {
+					transaction = library.logic.transaction.objectNormalize(transaction);
+				} catch (e) {
+					library.logger.error(['Transaction', id].join(' '), e.toString());
+					if (transaction) { library.logger.error('Transaction', transaction); }
+
+					library.logger.warn(['Transaction', id, 'is not valid, ban 60 min'].join(' '), peer.string);
+					modules.peers.state(peer.ip, peer.port, 0, 3600);
+
+					return setImmediate(waterCb, e);
+				}
+			}, function (err) {
+				return setImmediate(waterCb, err, transactions);
+			});
+		},
+		function (transactions, waterCb) {
+			library.balancesSequence.add(function (cb) {
+				modules.transactions.receiveTransactions(transactions, cb);
+			}, waterCb);
 		}
-
-		var report = library.schema.validate(res.body, schema.loadUnconfirmedTransactions);
-
-		if (!report) {
-			return setImmediate(cb);
-		}
-
-		var peer = modules.peers.inspect(res.peer);
-		var transactions = res.body.transactions;
-
-		for (var i = 0; i < transactions.length; i++) {
-			var transaction = transactions[i];
-			var id = (transaction ? transactions.id : 'null');
-
-			try {
-				transaction = library.logic.transaction.objectNormalize(transaction);
-			} catch (e) {
-				library.logger.error(['Transaction', id].join(' '), e.toString());
-				if (transaction) { library.logger.error('Transaction', transaction); }
-
-				library.logger.warn(['Transaction', id, 'is not valid, ban 60 min'].join(' '), peer.string);
-				modules.peers.state(peer.ip, peer.port, 0, 3600);
-
-				return setImmediate(cb);
-			}
-		}
-
-		library.balancesSequence.add(function (cb) {
-			modules.transactions.receiveTransactions(transactions, cb);
-		}, cb);
+	], function (err) {
+		return setImmediate(cb, err);
 	});
 };
 
@@ -157,49 +193,61 @@ __private.loadBlockChain = function () {
 		verify = true;
 		__private.total = count;
 
-		library.logic.account.removeTables(function (err) {
-			if (err) {
-				throw err;
-			} else {
+		async.series({
+			removeTables: function (seriesCb) {
+				library.logic.account.removeTables(function (err) {
+					if (err) {
+						throw err;
+					} else {
+						return setImmediate(seriesCb);
+					}
+				});
+			},
+			createTables: function (seriesCb) {
 				library.logic.account.createTables(function (err) {
 					if (err) {
 						throw err;
 					} else {
-						async.until(
-							function () {
-								return count < offset;
-							}, function (cb) {
-								if (count > 1) {
-									library.logger.info('Rebuilding blockchain, current block height: '  + (offset + 1));
-								}
-								modules.blocks.loadBlocksOffset(limit, offset, verify, function (err, lastBlockOffset) {
-									if (err) {
-										return setImmediate(cb, err);
-									}
-
-									offset = offset + limit;
-									__private.loadingLastBlock = lastBlockOffset;
-
-									return setImmediate(cb);
-								});
-							}, function (err) {
-								if (err) {
-									library.logger.error(err);
-									if (err.block) {
-										library.logger.error('Blockchain failed at: ' + err.block.height);
-										modules.blocks.simpleDeleteAfterBlock(err.block.id, function (err, res) {
-											library.logger.error('Blockchain clipped');
-											library.bus.message('blockchainReady');
-										});
-									}
-								} else {
-									library.logger.info('Blockchain ready');
-									library.bus.message('blockchainReady');
-								}
-							}
-						);
+						return setImmediate(seriesCb);
 					}
 				});
+			},
+			loadBlocksOffset: function (seriesCb) {
+				async.until(
+					function () {
+						return count < offset;
+					}, function (cb) {
+						if (count > 1) {
+							library.logger.info('Rebuilding blockchain, current block height: '  + (offset + 1));
+						}
+						modules.blocks.loadBlocksOffset(limit, offset, verify, function (err, lastBlock) {
+							if (err) {
+								return setImmediate(cb, err);
+							}
+
+							offset = offset + limit;
+							__private.lastBlock = lastBlock;
+
+							return setImmediate(cb);
+						});
+					}, function (err) {
+						return setImmediate(seriesCb, err);
+					}
+				);
+			}
+		}, function (err) {
+			if (err) {
+				library.logger.error(err);
+				if (err.block) {
+					library.logger.error('Blockchain failed at: ' + err.block.height);
+					modules.blocks.simpleDeleteAfterBlock(err.block.id, function (err, res) {
+						library.logger.error('Blockchain clipped');
+						library.bus.message('blockchainReady');
+					});
+				}
+			} else {
+				library.logger.info('Blockchain ready');
+				library.bus.message('blockchainReady');
 			}
 		});
 	}
@@ -209,12 +257,14 @@ __private.loadBlockChain = function () {
 			library.logger.warn(message);
 			library.logger.warn('Recreating memory tables');
 		}
-		load(count);
+
+		return load(count);
 	}
 
 	function checkMemTables (t) {
 		var promises = [
 			t.one(sql.countBlocks),
+			t.query(sql.getGenesisBlock),
 			t.one(sql.countMemAccounts),
 			t.query(sql.getMemRounds)
 		];
@@ -222,17 +272,24 @@ __private.loadBlockChain = function () {
 		return t.batch(promises);
 	}
 
-	library.db.task(checkMemTables).then(function (results) {
-		var count = results[0].count;
-		var missed = !(results[1].count);
+	function matchGenesisBlock (row) {
+		if (row) {
+			var matched = (
+				row.id === __private.genesisBlock.block.id &&
+				row.payloadHash.toString('hex') === __private.genesisBlock.block.payloadHash &&
+				row.blockSignature.toString('hex')  === __private.genesisBlock.block.blockSignature
+			);
+			if (matched) {
+				library.logger.info('Genesis block matched with database');
+			} else {
+				throw 'Failed to match genesis block with database';
+			}
+		}
+	}
 
-		library.logger.info('Blocks ' + count);
-
-		var round = modules.rounds.calc(count);
-
+	function verifySnapshot (count, round) {
 		if (library.config.loading.snapshot !== undefined || library.config.loading.snapshot > 0) {
 			library.logger.info('Snapshot mode enabled');
-			verify = true;
 
 			if (isNaN(library.config.loading.snapshot) || library.config.loading.snapshot >= round) {
 				library.config.loading.snapshot = round;
@@ -243,21 +300,38 @@ __private.loadBlockChain = function () {
 			}
 
 			library.logger.info('Snapshotting to end of round: ' + library.config.loading.snapshot);
+			return true;
+		} else {
+			return false;
 		}
+	}
+
+	library.db.task(checkMemTables).then(function (results) {
+		var count = results[0].count;
+
+		library.logger.info('Blocks ' + count);
+
+		var round = modules.rounds.calc(count);
 
 		if (count === 1) {
 			return reload(count);
 		}
 
+		matchGenesisBlock(results[1][0]);
+
+		verify = verifySnapshot(count, round);
+
 		if (verify) {
 			return reload(count, 'Blocks verification enabled');
 		}
+
+		var missed = !(results[2].count);
 
 		if (missed) {
 			return reload(count, 'Detected missed blocks in mem_accounts');
 		}
 
-		var unapplied = results[2].filter(function (row) {
+		var unapplied = results[3].filter(function (row) {
 			return (row.round !== String(round));
 		});
 
@@ -284,19 +358,19 @@ __private.loadBlockChain = function () {
 				return reload(count, 'No delegates found');
 			}
 
-			modules.blocks.loadBlocksOffset(1, count, verify, function (err, lastBlock) {
+			modules.blocks.loadLastBlock(function (err, block) {
 				if (err) {
-					return reload(count, err || 'Failed to load blocks offset');
+					return reload(count, err || 'Failed to load last block');
 				} else {
-					__private.lastBlock = lastBlock;
+					__private.lastBlock = block;
 					library.logger.info('Blockchain ready');
 					library.bus.message('blockchainReady');
 				}
 			});
 		});
 	}).catch(function (err) {
-		library.logger.error(err.stack);
-		return process.exit(0);
+		library.logger.error(err.stack || err);
+		return process.emit('exit');
 	});
 };
 
@@ -362,6 +436,36 @@ __private.loadBlocksFromNetwork = function (cb) {
 				}
 			);
 		}
+	});
+};
+
+__private.sync = function (cb) {
+	var transactions = modules.transactions.getUnconfirmedTransactionList(true);
+
+	library.logger.debug('Starting sync');
+
+	__private.isActive = true;
+	__private.syncTrigger(true);
+
+	async.series({
+		undoUnconfirmedList: function (cb) {
+			library.logger.debug('Undoing unconfirmed transactions before sync');
+			return modules.transactions.undoUnconfirmedList(cb);
+		},
+		loadBlocksFromNetwork: function (cb) {
+			return __private.loadBlocksFromNetwork(cb);
+		},
+		receiveTransactions: function (cb) {
+			library.logger.debug('Receiving unconfirmed transactions after sync');
+			return modules.transactions.receiveTransactions(transactions, cb);
+		}
+	}, function (err) {
+		__private.isActive = false;
+		__private.syncTrigger(false);
+		__private.blocksToSync = 0;
+
+		library.logger.debug('Finished sync');
+		return setImmediate(cb, err);
 	});
 };
 
@@ -500,19 +604,12 @@ Loader.prototype.onPeersReady = function () {
 		var lastReceipt = modules.blocks.lastReceipt();
 
 		if (__private.loaded && !self.syncing() && (!lastReceipt || lastReceipt.stale)) {
-			library.logger.debug('Loading blocks from network');
 			library.sequence.add(function (cb) {
-				__private.isActive = true;
-				__private.syncTrigger(true);
-				__private.loadBlocksFromNetwork(cb);
+				__private.sync(cb);
 			}, function (err) {
 				if (err) {
 					library.logger.warn('Blocks timer', err);
 				}
-
-				__private.isActive = false;
-				__private.syncTrigger(false);
-				__private.blocksToSync = 0;
 
 				setTimeout(nextLoadBlock, 10000);
 			});
@@ -523,7 +620,6 @@ Loader.prototype.onPeersReady = function () {
 
 	setImmediate(function nextLoadUnconfirmedTransactions () {
 		if (__private.loaded && !self.syncing()) {
-			library.logger.debug('Loading unconfirmed transactions');
 			__private.loadUnconfirmedTransactions(function (err) {
 				if (err) {
 					library.logger.warn('Unconfirmed transactions timer', err);
@@ -538,7 +634,6 @@ Loader.prototype.onPeersReady = function () {
 
 	setImmediate(function nextLoadSignatures () {
 		if (__private.loaded && !self.syncing()) {
-			library.logger.debug('Loading signatures');
 			__private.loadSignatures(function (err) {
 				if (err) {
 					library.logger.warn('Signatures timer', err);
@@ -582,7 +677,7 @@ __private.ping = function (cb) {
 shared.status = function (req, cb) {
 	return setImmediate(cb, null, {
 		loaded: __private.loaded,
-		now: __private.loadingLastBlock.height,
+		now: __private.lastBlock.height,
 		blocksCount: __private.total
 	});
 };

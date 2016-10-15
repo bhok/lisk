@@ -55,8 +55,9 @@ __private.attachApi = function () {
 			return res.status(406).send({success: false, error: 'Invalid request headers'});
 		}
 
-		var headers = req.headers;
-		headers.port = parseInt(req.headers.port);
+		var headers      = req.headers;
+		    headers.ip   = req.peer.ip;
+		    headers.port = req.peer.port;
 
 		req.sanitize(headers, schema.headers, function (err, report) {
 			if (err) { return next(err); }
@@ -370,19 +371,19 @@ __private.hashsum = function (obj) {
 };
 
 __private.banPeer = function (options) {
-	modules.peers.state(options.peer.ip, options.peer.port, 0, options.clock, function (err) {
-		library.logger.warn([options.code, ['Ban', options.peer.string, (options.clock / 60), 'minutes'].join(' '), options.req.method, options.req.url].join(' '));
-	});
+	library.logger.warn([options.code, ['Ban', options.peer.string, (options.clock / 60), 'minutes'].join(' '), options.req.method, options.req.url].join(' '));
+	modules.peers.state(options.peer.ip, options.peer.port, 0, options.clock);
 };
 
 __private.removePeer = function (options) {
-	modules.peers.remove(options.peer.ip, options.peer.port, function (err) {
-		library.logger.warn([options.code, 'Removing peer', options.peer.string, options.req.method, options.req.url].join(' '));
-	});
+	library.logger.warn([options.code, 'Removing peer', options.peer.string, options.req.method, options.req.url].join(' '));
+	modules.peers.remove(options.peer.ip, options.peer.port);
 };
 
 // Public methods
 Transport.prototype.broadcast = function (config, options, cb) {
+	library.logger.debug('Broadcast', options);
+
 	config.limit = config.limit || 1;
 	modules.peers.list(config, function (err, peers) {
 		if (!err) {
@@ -452,8 +453,9 @@ Transport.prototype.getFromPeer = function (peer, options, cb) {
 
 			return setImmediate(cb, ['Received bad response code', res.status, req.method, req.url].join(' '));
 		} else {
-			var headers = res.headers;
-			headers.port = parseInt(headers.port);
+			var headers      = res.headers;
+			    headers.ip   = peer.ip;
+			    headers.port = peer.port;
 
 			var report = library.schema.validate(headers, schema.headers);
 			if (!report) {
@@ -522,21 +524,21 @@ Transport.prototype.onBlockchainReady = function () {
 Transport.prototype.onSignature = function (signature, broadcast) {
 	if (broadcast) {
 		self.broadcast({limit: 100}, {api: '/signatures', data: {signature: signature}, method: 'POST'});
-		library.network.io.sockets.emit('signature/change', {});
+		library.network.io.sockets.emit('signature/change', signature);
 	}
 };
 
 Transport.prototype.onUnconfirmedTransaction = function (transaction, broadcast) {
 	if (broadcast) {
 		self.broadcast({limit: 100}, {api: '/transactions', data: {transaction: transaction}, method: 'POST'});
-		library.network.io.sockets.emit('transactions/change', {});
+		library.network.io.sockets.emit('transactions/change', transaction);
 	}
 };
 
 Transport.prototype.onNewBlock = function (block, broadcast) {
 	if (broadcast) {
 		self.broadcast({limit: 100}, {api: '/blocks', data: {block: block}, method: 'POST'});
-		library.network.io.sockets.emit('blocks/change', {});
+		library.network.io.sockets.emit('blocks/change', block);
 	}
 };
 

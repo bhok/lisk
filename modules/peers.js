@@ -7,6 +7,7 @@ var fs = require('fs');
 var ip = require('ip');
 var OrderBy = require('../helpers/orderBy.js');
 var path = require('path');
+var PeerSweeper = require('../helpers/peerSweeper.js');
 var Router = require('../helpers/router.js');
 var sandboxHelper = require('../helpers/sandbox.js');
 var schema = require('../schema/peers.js');
@@ -26,6 +27,7 @@ function Peers (cb, scope) {
 	self = this;
 
 	__private.attachApi();
+	__private.sweeper = new PeerSweeper({ library: library, sql: sql });
 
 	setImmediate(cb, null, self);
 }
@@ -77,14 +79,6 @@ __private.updatePeersList = function (cb) {
 					return removed.indexOf(peer.ip);
 			});
 
-			// Update only a subset of the peers to decrease the noise on the network.
-			// Default is 20 peers. To be fined tuned. Node gets checked by a peer every 3s on average.
-			// Maybe increasing schedule (every 60s right now).
-			var maxUpdatePeers = Math.floor(library.config.peers.options.maxUpdatePeers) || 20;
-			if (peers.length > maxUpdatePeers) {
-				peers = peers.slice(0, maxUpdatePeers);
-			}
-
 			// Drop one random peer from removed array to give them a chance.
 			// This mitigates the issue that a node could be removed forever if it was offline for long.
 			// This is not harmful for the node, but prevents network from shrinking, increasing noise.
@@ -106,11 +100,11 @@ __private.updatePeersList = function (cb) {
 						err.forEach(function (e) {
 							library.logger.error(['Rejecting invalid peer:', peer.ip, e.path, e.message].join(' '));
 						});
-
-						return setImmediate(cb);
 					} else {
-						return self.update(peer, cb);
+						self.update(peer);
 					}
+
+					return setImmediate(cb);
 				});
 			}, cb);
 		});
@@ -236,125 +230,39 @@ Peers.prototype.list = function (options, cb) {
 	});
 };
 
-Peers.prototype.state = function (pip, port, state, timeoutSeconds, cb) {
-	var isFrozenList = _.find(library.config.peers, function (peer) {
+Peers.prototype.state = function (pip, port, state, timeoutSeconds) {
+	var frozenPeer = _.find(library.config.peers, function (peer) {
 		return peer.ip === pip && peer.port === port;
 	});
-	if (isFrozenList !== undefined && cb) {
-		return setImmediate(cb, 'Peer in white list');
-	}
-	var clock;
-	if (state === 0) {
-		clock = (timeoutSeconds || 1) * 1000;
-		clock = Date.now() + clock;
-	} else {
-		clock = null;
-	}
-	var params = {
-		state: state,
-		clock: clock,
-		ip: pip,
-		port: port
-	};
-	library.db.query(sql.state, params).then(function (res) {
-		library.logger.debug('Updated peer state', params);
-		return cb && setImmediate(cb, null, res);
-	}).catch(function (err) {
-		library.logger.error(err.stack);
-		return cb && setImmediate(cb);
-	});
-};
-
-Peers.prototype.remove = function (pip, port, cb) {
-	var isFrozenList = _.find(library.config.peers.list, function (peer) {
-		return peer.ip === pip && peer.port === port;
-	});
-	if (isFrozenList !== undefined && cb) {
-		return setImmediate(cb, 'Peer in white list');
-	}
-	removed.push(pip);
-	var params = {
-		ip: pip,
-		port: port
-	};
-	library.db.query(sql.remove, params).then(function (res) {
-		library.logger.debug('Removed peer', params);
-		return cb && setImmediate(cb, null, res);
-	}).catch(function (err) {
-		library.logger.error(err.stack);
-		return cb && setImmediate(cb);
-	});
-};
-
-Peers.prototype.addDapp = function (config, cb) {
-	library.db.query(sql.getByIdPort, {
-		ip: config.ip,
-		port: config.port
-	}).then(function (rows) {
-		if (!rows.length) {
-			return setImmediate(cb);
+	if (!frozenPeer) {
+		var clock;
+		if (state === 0) {
+			clock = (timeoutSeconds || 1) * 1000;
+			clock = Date.now() + clock;
+		} else {
+			clock = null;
 		}
-
-		var params = {
-			dappId: config.dappid,
-			peerId: rows[0].id
-		};
-		library.db.query(sql.addDapp, params).then(function (res) {
-			library.logger.debug('Added dapp peer', params);
-			return setImmediate(cb, null, res);
-		}).catch(function (err) {
-			library.logger.error(err.stack);
-			return setImmediate(cb, 'Peers#addDapp error');
+		return __private.sweeper.push('state', {
+			state: state,
+			clock: clock,
+			ip: pip,
+			port: port
 		});
-	}).catch(function (err) {
-		library.logger.error(err.stack);
-		return setImmediate(cb, 'Peers#addDapp error');
-	});
+	}
 };
 
-Peers.prototype.update = function (peer, cb) {
-	var dappid = peer.dappid;
-	var params = {
-		ip: peer.ip,
-		port: peer.port,
-		os: peer.os || null,
-		version: peer.version || null
-	};
-	async.series([
-		function (cb) {
-			library.db.query(sql.insert, extend({}, params, { state: 1 })).then(function (res) {
-				library.logger.debug('Inserted peer', params);
-				return setImmediate(cb, null, res);
-			}).catch(function (err) {
-				library.logger.error(err.stack);
-				return setImmediate(cb, 'Peers#update error');
-			});
-		},
-		function (cb) {
-			if (peer.state !== undefined) {
-				params.state = peer.state;
-			}
-			library.db.query(sql.update(params), params).then(function (res) {
-				library.logger.debug('Updated peer', params);
-				return setImmediate(cb, null, res);
-			}).catch(function (err) {
-				library.logger.error(err.stack);
-				return setImmediate(cb, 'Peers#update error');
-			});
-		},
-		function (cb) {
-			if (dappid) {
-				self.addDapp({dappid: dappid, ip: peer.ip, port: peer.port}, cb);
-			} else {
-				return setImmediate(cb);
-			}
-		}
-	], function (err) {
-		if (err) {
-			library.logger.error(err);
-		}
-		return cb && setImmediate(cb);
+Peers.prototype.remove = function (pip, port) {
+	var frozenPeer = _.find(library.config.peers.list, function (peer) {
+		return peer.ip === pip && peer.port === port;
 	});
+	if (!frozenPeer) {
+		removed.push(pip);
+		return __private.sweeper.push('remove', { ip: pip, port: port });
+	}
+};
+
+Peers.prototype.update = function (peer) {
+	return __private.sweeper.push('upsert', peer);
 };
 
 Peers.prototype.sandboxApi = function (call, args, cb) {
