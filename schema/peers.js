@@ -30,7 +30,7 @@ module.exports = {
 				state: {
 					type: 'integer',
 					minimum: 0,
-					maximum: 3
+					maximum: 2
 				},
 				os: {
 					type: 'string',
@@ -39,6 +39,14 @@ module.exports = {
 				version: {
 					type: 'string',
 					maxLength: 11
+				},
+				broadhash: {
+					type: 'string',
+					format: 'hex'
+				},
+				height: {
+					type: 'integer',
+					minimum: 1
 				}
 			},
 			required: ['ip', 'port', 'state']
@@ -48,6 +56,10 @@ module.exports = {
 		id: 'peer.getPeers',
 		type: 'object',
 		properties: {
+			ip: {
+				type: 'string',
+				format: 'ip'
+			},
 			port: {
 				type: 'integer',
 				minimum: 1,
@@ -56,7 +68,7 @@ module.exports = {
 			state: {
 				type: 'integer',
 				minimum: 0,
-				maximum: 3
+				maximum: 2
 			},
 			os: {
 				type: 'string',
@@ -66,12 +78,20 @@ module.exports = {
 				type: 'string',
 				maxLength: 11
 			},
+			broadhash: {
+				type: 'string',
+				format: 'hex'
+			},
+			height: {
+				type: 'integer',
+				minimum: 1
+			},
 			orderBy: {
 				type: 'string'
 			},
 			limit: {
 				type: 'integer',
-				minimum: 0,
+				minimum: 1,
 				maximum: 100
 			},
 			offset: {

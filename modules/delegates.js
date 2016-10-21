@@ -231,7 +231,7 @@ __private.forge = function (cb) {
 	}
 
 	if (!__private.forging) {
-		library.logger.debug('Forging disabled due to timeout');
+		library.logger.debug('Forging disabled');
 		return setImmediate(cb);
 	}
 
@@ -246,7 +246,7 @@ __private.forge = function (cb) {
 	var lastBlock = modules.blocks.getLastBlock();
 
 	if (currentSlot === slots.getSlotNumber(lastBlock.timestamp)) {
-		library.logger.debug('Last block within same delegate slot');
+		library.logger.debug('Waiting for next delegate slot');
 		return setImmediate(cb);
 	}
 

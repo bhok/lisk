@@ -90,7 +90,7 @@ __private.loadSignatures = function (cb) {
 			});
 		},
 		function (peer, waterCb) {
-			library.logger.info('Loading signatures from: ' + peer.string);
+			library.logger.log('Loading signatures from: ' + peer.string);
 
 			modules.transport.getFromPeer(peer, {
 				api: '/signatures',
@@ -137,7 +137,7 @@ __private.loadUnconfirmedTransactions = function (cb) {
 			});
 		},
 		function (peer, waterCb) {
-			library.logger.info('Loading unconfirmed transactions from: ' + peer.string);
+			library.logger.log('Loading unconfirmed transactions from: ' + peer.string);
 
 			modules.transport.getFromPeer(peer, {
 				api: '/transactions',
@@ -169,8 +169,10 @@ __private.loadUnconfirmedTransactions = function (cb) {
 					library.logger.warn(['Transaction', id, 'is not valid, ban 60 min'].join(' '), peer.string);
 					modules.peers.state(peer.ip, peer.port, 0, 3600);
 
-					return setImmediate(waterCb, e);
+					return setImmediate(eachSeriesCb, e);
 				}
+
+				return setImmediate(eachSeriesCb);
 			}, function (err) {
 				return setImmediate(waterCb, err, transactions);
 			});
@@ -442,43 +444,51 @@ __private.loadBlocksFromNetwork = function (cb) {
 __private.sync = function (cb) {
 	var transactions = modules.transactions.getUnconfirmedTransactionList(true);
 
-	library.logger.debug('Starting sync');
+	library.logger.info('Starting sync');
 
 	__private.isActive = true;
 	__private.syncTrigger(true);
 
 	async.series({
-		undoUnconfirmedList: function (cb) {
+		undoUnconfirmedList: function (seriesCb) {
 			library.logger.debug('Undoing unconfirmed transactions before sync');
-			return modules.transactions.undoUnconfirmedList(cb);
+			return modules.transactions.undoUnconfirmedList(seriesCb);
 		},
-		loadBlocksFromNetwork: function (cb) {
-			return __private.loadBlocksFromNetwork(cb);
+		loadBlocksFromNetwork: function (seriesCb) {
+			return __private.loadBlocksFromNetwork(seriesCb);
 		},
-		receiveTransactions: function (cb) {
+		updateSystem: function (seriesCb) {
+			return modules.system.update(seriesCb);
+		},
+		receiveTransactions: function (seriesCb) {
 			library.logger.debug('Receiving unconfirmed transactions after sync');
-			return modules.transactions.receiveTransactions(transactions, cb);
+			return modules.transactions.receiveTransactions(transactions, seriesCb);
 		}
 	}, function (err) {
 		__private.isActive = false;
 		__private.syncTrigger(false);
 		__private.blocksToSync = 0;
 
-		library.logger.debug('Finished sync');
+		library.logger.info('Finished sync');
 		return setImmediate(cb, err);
 	});
 };
 
 // Given a list of peers with associated blockchain height (heights = {peer: peer, height: height}), we find a list of good peers (likely to sync with), then perform a histogram cut, removing peers far from the most common observed height. This is not as easy as it sounds, since the histogram has likely been made accross several blocks, therefore need to aggregate).
 __private.findGoodPeers = function (heights) {
-	// Removing unreachable peers
+	var lastBlockHeight = modules.blocks.getLastBlock().height;
+
 	heights = heights.filter(function (item) {
+		// Removing unreachable peers
 		return item != null;
+	}).filter(function (item) {
+		// Remove heights below last block height
+		return item.height >= lastBlockHeight;
 	});
 
-	// Assuming that the node reached at least 10% of the network
-	if (heights.length < 10) {
-		return { height: 0, peers: [] };
+	// No peers found
+	if (heights.length === 0) {
+		return {height: 0, peers: []};
 	} else {
 		// Ordering the peers with descending height
 		heights = heights.sort(function (a,b) {
@@ -511,8 +521,61 @@ __private.findGoodPeers = function (heights) {
 			item.peer.height = item.height;
 			return item.peer;
 		});
+
+		library.logger.debug('Good peers', peers);
+
 		return {height: height, peers: peers};
 	}
+};
+
+__private.getPeer = function (peer, cb) {
+	async.series({
+		validatePeer: function (seriesCb) {
+			peer = modules.peers.accept(peer);
+
+			library.schema.validate(peer, schema.getNetwork.peer, function (err) {
+				if (err) {
+					return setImmediate(seriesCb, ['Failed to validate peer:', err[0].path, err[0].message].join(' '));
+				} else {
+					return setImmediate(seriesCb, null);
+				}
+			});
+		},
+		getHeight: function (seriesCb) {
+			if (peer.height >= modules.blocks.getLastBlock().height) {
+				return setImmediate(seriesCb);
+			} else {
+				modules.transport.getFromPeer(peer, {
+					api: '/height',
+					method: 'GET'
+				}, function (err, res) {
+					if (err) {
+						return setImmediate(seriesCb, 'Failed to get height from peer: ' + peer.string);
+					} else {
+						peer.height = res.body.height;
+						modules.peers.update(peer);
+						return setImmediate(seriesCb);
+					}
+				});
+			}
+		},
+		validateHeight: function (seriesCb) {
+			var heightIsValid = library.schema.validate(peer, schema.getNetwork.height);
+
+			if (heightIsValid) {
+				library.logger.log(['Received height:', peer.height, 'from peer:', peer.string].join(' '));
+				return setImmediate(seriesCb);
+			} else {
+				return setImmediate(seriesCb, 'Received invalid height from peer: ' + peer.string);
+			}
+		}
+	}, function (err) {
+		if (err) {
+			peer.height = null;
+			library.logger.error(err);
+		}
+		return setImmediate(cb, null, {peer: peer, height: peer.height});
+	});
 };
 
 // Public methods
@@ -522,71 +585,51 @@ __private.findGoodPeers = function (heights) {
 // - Then for each of them we grab the height of their blockchain.
 // - With this list we try to get a peer with sensibly good blockchain height (see __private.findGoodPeers for actual strategy).
 Loader.prototype.getNetwork = function (cb) {
-	// If __private.network.height is not so far (i.e. 1 round) from current node height, just return cached __private.network.
-	if (__private.network.height > 0 && Math.abs(__private.network.height - modules.blocks.getLastBlock().height) < 101) {
+	if (__private.network.height > 0 && Math.abs(__private.network.height - modules.blocks.getLastBlock().height) === 1) {
 		return setImmediate(cb, null, __private.network);
 	}
+	async.waterfall([
+		function (waterCb) {
+			modules.transport.getFromRandomPeer({
+				api: '/list',
+				method: 'GET'
+			}, function (err, res) {
+				if (err) {
+					return setImmediate(waterCb, err);
+				} else {
+					return setImmediate(waterCb, null, res);
+				}
+			});
+		},
+		function (res, waterCb) {
+			library.schema.validate(res.body, schema.getNetwork.peers, function (err) {
+				var peers = res.body.peers;
 
-	// Fetch a list of 100 random peers
-	modules.transport.getFromRandomPeer({
-		api: '/list',
-		method: 'GET'
-	}, function (err, res) {
+				if (err) {
+					return setImmediate(waterCb, err);
+				} else {
+					library.logger.log(['Received', peers.length, 'peers from'].join(' '), res.peer.string);
+					return setImmediate(waterCb, null, peers);
+				}
+			});
+		},
+		function (peers, waterCb) {
+			async.map(peers, __private.getPeer, function (err, peers) {
+				return setImmediate(waterCb, err, peers);
+			});
+		}
+	], function (err, heights) {
 		if (err) {
-			library.logger.info('Failed to connect properly with network', err);
 			return setImmediate(cb, err);
 		}
 
-		library.schema.validate(res.body, schema.getNetwork.peers, function (err) {
-			if (err) {
-				return setImmediate(cb, err);
-			}
+		__private.network = __private.findGoodPeers(heights);
 
-			var peers = res.body.peers;
-
-			library.logger.debug(['Received', res.body.peers.length, 'peers from'].join(' '), res.peer.string);
-
-			// Validate each peer and then attempt to get its height
-			async.map(peers, function (peer, cb) {
-				var peerIsValid = library.schema.validate(modules.peers.inspect(peer), schema.getNetwork.peer);
-
-				if (peerIsValid) {
-					modules.transport.getFromPeer(peer, {
-						api: '/height',
-						method: 'GET'
-					}, function (err, res) {
-						if (err) {
-							library.logger.error(err);
-							library.logger.warn('Failed to get height from peer', peer.string);
-							return setImmediate(cb);
-						}
-
-						var heightIsValid = library.schema.validate(res.body, schema.getNetwork.height);
-
-						if (heightIsValid) {
-							library.logger.info(['Received height:', res.body.height, 'from peer'].join(' '), peer.string);
-							return setImmediate(cb, null, {peer: peer, height: res.body.height});
-						} else {
-							library.logger.warn('Received invalid height from peer', peer.string);
-							return setImmediate(cb);
-						}
-					});
-				} else {
-					library.logger.warn('Failed to validate peer', peer);
-					return setImmediate(cb);
-				}
-			}, function (err, heights) {
-				__private.network = __private.findGoodPeers(heights);
-
-				if (err) {
-					return setImmediate(cb, err);
-				} else if (!__private.network.peers.length) {
-					return setImmediate(cb, 'Failed to find enough good peers to sync with');
-				} else {
-					return setImmediate(cb, null, __private.network);
-				}
-			});
-		});
+		if (!__private.network.peers.length) {
+			return setImmediate(cb, 'Failed to find enough good peers');
+		} else {
+			return setImmediate(cb, null, __private.network);
+		}
 	});
 };
 
@@ -600,50 +643,54 @@ Loader.prototype.sandboxApi = function (call, args, cb) {
 
 // Events
 Loader.prototype.onPeersReady = function () {
-	setImmediate(function nextLoadBlock () {
-		var lastReceipt = modules.blocks.lastReceipt();
+	setImmediate(function nextSeries () {
+		async.series({
+			sync: function (seriesCb) {
+				var lastReceipt = modules.blocks.lastReceipt();
 
-		if (__private.loaded && !self.syncing() && (!lastReceipt || lastReceipt.stale)) {
-			library.sequence.add(function (cb) {
-				__private.sync(cb);
-			}, function (err) {
-				if (err) {
-					library.logger.warn('Blocks timer', err);
+				if (__private.loaded && !self.syncing() && (!lastReceipt || lastReceipt.stale)) {
+					library.sequence.add(function (cb) {
+						__private.sync(cb);
+					}, function (err) {
+						if (err) {
+							library.logger.warn('Sync timer', err);
+						}
+
+						return setImmediate(seriesCb);
+					});
+				} else {
+					return setImmediate(seriesCb);
 				}
+			},
+			loadUnconfirmedTransactions: function (seriesCb) {
+				if (__private.loaded) {
+					__private.loadUnconfirmedTransactions(function (err) {
+						if (err) {
+							library.logger.warn('Unconfirmed transactions timer', err);
+						}
 
-				setTimeout(nextLoadBlock, 10000);
-			});
-		} else {
-			setTimeout(nextLoadBlock, 10000);
-		}
-	});
-
-	setImmediate(function nextLoadUnconfirmedTransactions () {
-		if (__private.loaded && !self.syncing()) {
-			__private.loadUnconfirmedTransactions(function (err) {
-				if (err) {
-					library.logger.warn('Unconfirmed transactions timer', err);
+						return setImmediate(seriesCb);
+					});
+				} else {
+					return setImmediate(seriesCb);
 				}
+			},
+			loadSignatures: function (seriesCb) {
+				if (__private.loaded) {
+					__private.loadSignatures(function (err) {
+						if (err) {
+							library.logger.warn('Signatures timer', err);
+						}
 
-				setTimeout(nextLoadUnconfirmedTransactions, 14000);
-			});
-		} else {
-			setTimeout(nextLoadUnconfirmedTransactions, 14000);
-		}
-	});
-
-	setImmediate(function nextLoadSignatures () {
-		if (__private.loaded && !self.syncing()) {
-			__private.loadSignatures(function (err) {
-				if (err) {
-					library.logger.warn('Signatures timer', err);
+						return setImmediate(seriesCb);
+					});
+				} else {
+					return setImmediate(seriesCb);
 				}
-
-				setTimeout(nextLoadSignatures, 14000);
-			});
-		} else {
-			setTimeout(nextLoadSignatures, 14000);
-		}
+			}
+		}, function (err) {
+			return setTimeout(nextSeries, 10000);
+		});
 	});
 };
 

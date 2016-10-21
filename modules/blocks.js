@@ -100,6 +100,7 @@ __private.attachApi = function () {
 	router.map(shared, {
 		'get /get': 'getBlock',
 		'get /': 'getBlocks',
+		'get /getBroadhash': 'getBroadhash',
 		'get /getEpoch': 'getEpoch',
 		'get /getHeight': 'getHeight',
 		'get /getNethash': 'getNethash',
@@ -1068,7 +1069,7 @@ Blocks.prototype.simpleDeleteAfterBlock = function (blockId, cb) {
 Blocks.prototype.loadBlocksFromPeer = function (peer, cb) {
 	var lastValidBlock = __private.lastBlock;
 
-	peer = modules.peers.inspect(peer);
+	peer = modules.peers.accept(peer);
 	library.logger.info('Loading blocks from: ' + peer.string);
 
 	modules.transport.getFromPeer(peer, {
@@ -1238,7 +1239,7 @@ Blocks.prototype.cleanup = function (cb) {
 		setImmediate(function nextWatch () {
 			if (__private.isActive) {
 				library.logger.info('Waiting for block processing to finish...');
-				setTimeout(nextWatch, 1 * 1000);
+				setTimeout(nextWatch, 10000);
 			} else {
 				return setImmediate(cb);
 			}
@@ -1289,6 +1290,14 @@ shared.getBlocks = function (req, cb) {
 	});
 };
 
+shared.getBroadhash = function (req, cb) {
+	if (!__private.loaded) {
+		return setImmediate(cb, 'Blockchain is loading');
+	}
+
+	return setImmediate(cb, null, {broadhash: modules.system.getBroadhash()});
+};
+
 shared.getEpoch = function (req, cb) {
 	if (!__private.loaded) {
 		return setImmediate(cb, 'Blockchain is loading');
@@ -1326,7 +1335,7 @@ shared.getNethash = function (req, cb) {
 		return setImmediate(cb, 'Blockchain is loading');
 	}
 
-	return setImmediate(cb, null, {nethash: library.config.nethash});
+	return setImmediate(cb, null, {nethash: modules.system.getNethash()});
 };
 
 shared.getMilestone = function (req, cb) {
@@ -1359,11 +1368,12 @@ shared.getStatus = function (req, cb) {
 	}
 
 	return setImmediate(cb, null, {
+		broadhash: modules.system.getBroadhash(),
 		epoch:     constants.epochTime,
 		height:    __private.lastBlock.height,
 		fee:       library.logic.block.calculateFee(),
 		milestone: __private.blockReward.calcMilestone(__private.lastBlock.height),
-		nethash:   library.config.nethash,
+		nethash:   modules.system.getNethash(),
 		reward:    __private.blockReward.calcReward(__private.lastBlock.height),
 		supply:    __private.blockReward.calcSupply(__private.lastBlock.height)
 	});

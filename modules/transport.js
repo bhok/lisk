@@ -35,29 +35,22 @@ __private.attachApi = function () {
 	var router = new Router();
 
 	router.use(function (req, res, next) {
+		res.set(__private.headers);
+
 		if (modules && __private.loaded) { return next(); }
 		res.status(500).send({success: false, error: 'Blockchain is loading'});
 	});
 
 	router.use(function (req, res, next) {
-		try {
-			req.peer = modules.peers.inspect(
-				{
-					ip: req.headers['x-forwarded-for'] || req.connection.remoteAddress,
-					port: req.headers.port
-				}
-			);
-		} catch (e) {
-			// Remove peer
-			__private.removePeer({peer: req.peer, code: 'EHEADERS', req: req});
+		req.peer = modules.peers.accept(
+			{
+				ip: req.headers['x-forwarded-for'] || req.connection.remoteAddress,
+				port: req.headers.port,
+				state: 2
+			}
+		);
 
-			library.logger.debug(e.toString());
-			return res.status(406).send({success: false, error: 'Invalid request headers'});
-		}
-
-		var headers      = req.headers;
-		    headers.ip   = req.peer.ip;
-		    headers.port = req.peer.port;
+		var headers = req.peer.extend(req.headers);
 
 		req.sanitize(headers, schema.headers, function (err, report) {
 			if (err) { return next(err); }
@@ -68,28 +61,22 @@ __private.attachApi = function () {
 				return res.status(500).send({status: false, error: report.issues});
 			}
 
-			if (headers.nethash !== library.config.nethash) {
+			if (headers.nethash !== modules.system.getNethash()) {
 				// Remove peer
 				__private.removePeer({peer: req.peer, code: 'ENETHASH', req: req});
 
-				return res.status(200).send({success: false, message: 'Request is made on the wrong network', expected: library.config.nethash, received: headers.nethash});
+				return res.status(200).send({success: false, message: 'Request is made on the wrong network', expected: modules.system.getNethash(), received: headers.nethash});
 			}
 
-			req.peer.state = 2;
-			req.peer.os = headers.os;
-			req.peer.version = headers.version;
+			if (!modules.blocks.lastReceipt()) {
+				modules.delegates.enableForging();
+			}
 
 			if (req.body && req.body.dappid) {
 				req.peer.dappid = req.body.dappid;
 			}
 
-			if ((req.peer.version === library.config.version) && (headers.nethash === library.config.nethash)) {
-				if (!modules.blocks.lastReceipt()) {
-					modules.delegates.enableForging();
-				}
-
-				modules.peers.update(req.peer);
-			}
+			modules.peers.update(req.peer);
 
 			return next();
 		});
@@ -97,15 +84,12 @@ __private.attachApi = function () {
 	});
 
 	router.get('/list', function (req, res) {
-		res.set(__private.headers);
 		modules.peers.list({limit: 100}, function (err, peers) {
 			return res.status(200).json({peers: !err ? peers : []});
 		});
 	});
 
 	router.get('/blocks/common', function (req, res, next) {
-		res.set(__private.headers);
-
 		req.sanitize(req.query, schema.commonBlock, function (err, report, query) {
 			if (err) { return next(err); }
 			if (!report.isValid) { return res.json({success: false, error: report.issues}); }
@@ -136,8 +120,6 @@ __private.attachApi = function () {
 	});
 
 	router.get('/blocks', function (req, res, next) {
-		res.set(__private.headers);
-
 		req.sanitize(req.query, schema.blocks, function (err, report, query) {
 			if (err) { return next(err); }
 			if (!report.isValid) { return res.json({success: false, error: report.issues}); }
@@ -159,8 +141,6 @@ __private.attachApi = function () {
 	});
 
 	router.post('/blocks', function (req, res) {
-		res.set(__private.headers);
-
 		var block = req.body.block;
 		var id = (block ? block.id : 'null');
 
@@ -184,8 +164,6 @@ __private.attachApi = function () {
 	});
 
 	router.post('/signatures', function (req, res) {
-		res.set(__private.headers);
-
 		library.schema.validate(req.body, schema.signatures, function (err) {
 			if (err) {
 				return res.status(200).json({success: false, error: 'Signature validation failed'});
@@ -202,8 +180,6 @@ __private.attachApi = function () {
 	});
 
 	router.get('/signatures', function (req, res) {
-		res.set(__private.headers);
-
 		var unconfirmedList = modules.transactions.getUnconfirmedTransactionList();
 		var signatures = [];
 
@@ -222,13 +198,10 @@ __private.attachApi = function () {
 	});
 
 	router.get('/transactions', function (req, res) {
-		res.set(__private.headers);
 		res.status(200).json({success: true, transactions: modules.transactions.getUnconfirmedTransactionList()});
 	});
 
 	router.post('/transactions', function (req, res) {
-		res.set(__private.headers);
-
 		var transaction = req.body.transaction;
 		var id = (transaction? transaction.id : 'null');
 
@@ -262,7 +235,6 @@ __private.attachApi = function () {
 	});
 
 	router.get('/height', function (req, res) {
-		res.set(__private.headers);
 		res.status(200).json({
 			success: true,
 			height: modules.blocks.getLastBlock().height
@@ -270,8 +242,6 @@ __private.attachApi = function () {
 	});
 
 	router.post('/dapp/message', function (req, res) {
-		res.set(__private.headers);
-
 		try {
 			if (!req.body.dappid) {
 				return res.status(200).json({success: false, message: 'Missing dappid'});
@@ -312,8 +282,6 @@ __private.attachApi = function () {
 	});
 
 	router.post('/dapp/request', function (req, res) {
-		res.set(__private.headers);
-
 		try {
 			if (!req.body.dappid) {
 				return res.status(200).json({success: false, message: 'Missing dappid'});
@@ -381,15 +349,27 @@ __private.removePeer = function (options) {
 };
 
 // Public methods
+Transport.prototype.headers = function (headers) {
+	if (headers) {
+		__private.headers = headers;
+	}
+
+	return __private.headers;
+};
+
 Transport.prototype.broadcast = function (config, options, cb) {
-	library.logger.debug('Broadcast', options);
+	library.logger.debug('Begin broadcast', options);
 
 	config.limit = config.limit || 1;
+	config.broadhash = config.broadhash || null;
+	config.height = config.height || null;
+
 	modules.peers.list(config, function (err, peers) {
 		if (!err) {
-			async.eachLimit(peers, 3, function (peer, cb) {
+			async.eachLimit(peers, 20, function (peer, cb) {
 				return self.getFromPeer(peer, options, cb);
 			}, function (err) {
+				library.logger.debug('End broadcast');
 				if (cb) {
 					return setImmediate(cb, null, {body: null, peer: peers});
 				}
@@ -407,16 +387,12 @@ Transport.prototype.getFromRandomPeer = function (config, options, cb) {
 		config = {};
 	}
 	config.limit = 1;
-	async.retry(20, function (cb) {
-		modules.peers.list(config, function (err, peers) {
-			if (!err && peers.length) {
-				return self.getFromPeer(peers[0], options, cb);
-			} else {
-				return setImmediate(cb, err || 'No reachable peers in db');
-			}
-		});
-	}, function (err, results) {
-		return setImmediate(cb, err, results);
+	modules.peers.list(config, function (err, peers) {
+		if (!err && peers.length) {
+			return self.getFromPeer(peers[0], options, cb);
+		} else {
+			return setImmediate(cb, err || 'No acceptable peers found');
+		}
 	});
 };
 
@@ -429,12 +405,13 @@ Transport.prototype.getFromPeer = function (peer, options, cb) {
 		url = options.url;
 	}
 
-	peer = modules.peers.inspect(peer);
+	peer = modules.peers.accept(peer);
+	peer.state = 2;
 
 	var req = {
 		url: 'http://' + peer.ip + ':' + peer.port + url,
 		method: options.method,
-		headers: _.extend({}, __private.headers, options.headers),
+		headers: extend({}, __private.headers, options.headers),
 		timeout: library.config.peers.options.timeout
 	};
 
@@ -453,9 +430,7 @@ Transport.prototype.getFromPeer = function (peer, options, cb) {
 
 			return setImmediate(cb, ['Received bad response code', res.status, req.method, req.url].join(' '));
 		} else {
-			var headers      = res.headers;
-			    headers.ip   = peer.ip;
-			    headers.port = peer.port;
+			var headers = peer.extend(res.headers);
 
 			var report = library.schema.validate(headers, schema.headers);
 			if (!report) {
@@ -465,22 +440,18 @@ Transport.prototype.getFromPeer = function (peer, options, cb) {
 				return setImmediate(cb, ['Invalid response headers', JSON.stringify(headers), req.method, req.url].join(' '));
 			}
 
-			if (headers.nethash !== library.config.nethash) {
+			if (headers.nethash !== modules.system.getNethash()) {
 				// Remove peer
 				__private.removePeer({peer: peer, code: 'ENETHASH', req: req});
 
 				return setImmediate(cb, ['Peer is not on the same network', headers.nethash, req.method, req.url].join(' '));
 			}
 
-			if (headers.version === library.config.version) {
-				modules.peers.update({
-					ip: peer.ip,
-					port: headers.port,
-					state: 2,
-					os: headers.os,
-					version: headers.version
-				});
+			if (res.body.height) {
+				peer.height = res.body.height;
 			}
+
+			modules.peers.update(peer);
 
 			return setImmediate(cb, null, {body: res.body, peer: peer});
 		}
@@ -509,12 +480,7 @@ Transport.prototype.sandboxApi = function (call, args, cb) {
 Transport.prototype.onBind = function (scope) {
 	modules = scope;
 
-	__private.headers = {
-		os: modules.system.getOS(),
-		version: modules.system.getVersion(),
-		port: modules.system.getPort(),
-		nethash: modules.system.getNethash()
-	};
+	__private.headers = modules.system.headers();
 };
 
 Transport.prototype.onBlockchainReady = function () {
@@ -537,8 +503,13 @@ Transport.prototype.onUnconfirmedTransaction = function (transaction, broadcast)
 
 Transport.prototype.onNewBlock = function (block, broadcast) {
 	if (broadcast) {
-		self.broadcast({limit: 100}, {api: '/blocks', data: {block: block}, method: 'POST'});
-		library.network.io.sockets.emit('blocks/change', block);
+		var broadhash = modules.system.getBroadhash();
+		var height = modules.system.getHeight();
+
+		modules.system.update(function () {
+			self.broadcast({limit: 100, broadhash: broadhash, height: height}, {api: '/blocks', data: {block: block}, method: 'POST'});
+			library.network.io.sockets.emit('blocks/change', block);
+		});
 	}
 };
 
